@@ -18,6 +18,7 @@ const SUBKEYS = '__subkeys'
 const SESSIONS = '__sessions'
 
 const APPEND_SCRIPT = `
+-- append
 local entry_type = redis.call('TYPE', KEYS[1]).ok
 local index_type = redis.call('TYPE', KEYS[2]).ok
 if entry_type ~= 'none' and entry_type ~= 'list' then
@@ -27,7 +28,10 @@ if index_type ~= 'none' and index_type ~= ARGV[1] then
   return redis.error_reply('WRONGTYPE index key must hold a ' .. ARGV[1])
 end
 local first_entry = ARGV[1] == 'set' and 3 or 4
-local length = redis.call('RPUSH', KEYS[1], unpack(ARGV, first_entry))
+local length = 0
+for i = first_entry, #ARGV, 1000 do
+  length = redis.call('RPUSH', KEYS[1], unpack(ARGV, i, math.min(i + 999, #ARGV)))
+end
 if ARGV[1] == 'set' then
   redis.call('SADD', KEYS[2], ARGV[2])
 else
@@ -36,12 +40,39 @@ end
 return length
 `
 
-function throwTransactionError(
-  results: [error: Error | null, result: unknown][] | null,
-): void {
-  const error = results?.find(([commandError]) => commandError)?.[0]
-  if (error) throw error
-}
+const DELETE_SUBPATH_SCRIPT = `
+-- delete-subpath
+local index_type = redis.call('TYPE', KEYS[2]).ok
+if index_type ~= 'none' and index_type ~= 'set' then
+  return redis.error_reply('WRONGTYPE subpath index key must hold a set')
+end
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[1])
+return 1
+`
+
+const DELETE_SESSION_SCRIPT = `
+-- delete-session
+local subkeys_type = redis.call('TYPE', KEYS[2]).ok
+local sessions_type = redis.call('TYPE', KEYS[3]).ok
+if subkeys_type ~= 'none' and subkeys_type ~= 'set' then
+  return redis.error_reply('WRONGTYPE subpath index key must hold a set')
+end
+if sessions_type ~= 'none' and sessions_type ~= 'zset' then
+  return redis.error_reply('WRONGTYPE session index key must hold a zset')
+end
+local subpaths = redis.call('SMEMBERS', KEYS[2])
+redis.call('DEL', KEYS[1], KEYS[2])
+for i = 1, #subpaths, 1000 do
+  local keys = {}
+  for j = i, math.min(i + 999, #subpaths) do
+    keys[#keys + 1] = KEYS[1] .. ':' .. subpaths[j]
+  end
+  redis.call('DEL', unpack(keys))
+end
+redis.call('ZREM', KEYS[3], ARGV[1])
+return 1
+`
 
 /**
  * Redis-backed SessionStore.
@@ -137,30 +168,22 @@ export class RedisSessionStore implements SessionStore {
 
   async delete(key: SessionKey): Promise<void> {
     if (key.subpath !== undefined) {
-      // Targeted: remove just this subpath list and its index entry.
-      throwTransactionError(
-        await this.client
-          .multi()
-          .del(this.entryKey(key))
-          .srem(this.subkeysKey(key), key.subpath)
-          .exec(),
+      await this.client.eval(
+        DELETE_SUBPATH_SCRIPT,
+        2,
+        this.entryKey(key),
+        this.subkeysKey(key),
+        key.subpath,
       )
       return
     }
-    // Cascade: main list + every subpath list + subkey set + session-index entry.
-    const subkeysKey = this.subkeysKey(key)
-    const subpaths = await this.client.smembers(subkeysKey)
-    const toDelete = [
+    await this.client.eval(
+      DELETE_SESSION_SCRIPT,
+      3,
       this.entryKey(key),
-      subkeysKey,
-      ...subpaths.map(sp => this.entryKey({ ...key, subpath: sp })),
-    ]
-    throwTransactionError(
-      await this.client
-        .multi()
-        .del(...toDelete)
-        .zrem(this.sessionsKey(key.projectKey), key.sessionId)
-        .exec(),
+      this.subkeysKey(key),
+      this.sessionsKey(key.projectKey),
+      key.sessionId,
     )
   }
 

@@ -52,6 +52,52 @@ describe.skipIf(!url)('RedisSessionStore (live conformance)', () => {
     expect(await client.lrange(`${prefix}:p:s`, 0, -1)).toEqual([])
   })
 
+  test('append supports batches larger than the Lua unpack limit', async () => {
+    const prefix = `${root}:large`
+    const store = new RedisSessionStore({ client, prefix })
+    const entries = Array.from({ length: 10_000 }, (_, index) => ({
+      type: 'assistant',
+      index,
+    }))
+
+    await store.append({ projectKey: 'p', sessionId: 's' }, entries)
+
+    const loaded = await store.load({ projectKey: 'p', sessionId: 's' })
+    expect(loaded).toHaveLength(entries.length)
+    expect(loaded?.[0]).toEqual(entries[0])
+    expect(loaded?.at(-1)).toEqual(entries.at(-1))
+  })
+
+  test('main delete is atomic when the session index has the wrong type', async () => {
+    const prefix = `${root}:delete-main`
+    const store = new RedisSessionStore({ client, prefix })
+    const key = { projectKey: 'p', sessionId: 's' }
+    const entry = { type: 'assistant' }
+    await store.append(key, [entry])
+    await client.del(`${prefix}:p:__sessions`)
+    await client.set(`${prefix}:p:__sessions`, 'wrong-type')
+
+    await expect(store.delete(key)).rejects.toThrow('WRONGTYPE')
+    expect(await store.load(key)).toEqual([entry])
+  })
+
+  test('subpath delete is atomic when the subpath index has the wrong type', async () => {
+    const prefix = `${root}:delete-subpath`
+    const store = new RedisSessionStore({ client, prefix })
+    const key = {
+      projectKey: 'p',
+      sessionId: 's',
+      subpath: 'subagents/a',
+    }
+    const entry = { type: 'assistant' }
+    await store.append(key, [entry])
+    await client.del(`${prefix}:p:s:__subkeys`)
+    await client.set(`${prefix}:p:s:__subkeys`, 'wrong-type')
+
+    await expect(store.delete(key)).rejects.toThrow('WRONGTYPE')
+    expect(await store.load(key)).toEqual([entry])
+  })
+
   afterAll(async () => {
     const keys = await client.keys(`${root}:*`)
     if (keys.length) await client.del(...keys)
