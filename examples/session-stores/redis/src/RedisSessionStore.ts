@@ -28,6 +28,18 @@ if index_type ~= 'none' and index_type ~= ARGV[1] then
   return redis.error_reply('WRONGTYPE index key must hold a ' .. ARGV[1])
 end
 local first_entry = ARGV[1] == 'set' and 3 or 4
+if not redis.acl_check_cmd('RPUSH', KEYS[1], ARGV[first_entry]) then
+  return redis.error_reply('NOPERM append requires RPUSH access')
+end
+if ARGV[1] == 'set' then
+  if not redis.acl_check_cmd('SADD', KEYS[2], ARGV[2]) then
+    return redis.error_reply('NOPERM append requires SADD access')
+  end
+else
+  if not redis.acl_check_cmd('ZADD', KEYS[2], ARGV[2], ARGV[3]) then
+    return redis.error_reply('NOPERM append requires ZADD access')
+  end
+end
 local length = 0
 for i = first_entry, #ARGV, 1000 do
   length = redis.call('RPUSH', KEYS[1], unpack(ARGV, i, math.min(i + 999, #ARGV)))
@@ -46,6 +58,12 @@ local index_type = redis.call('TYPE', KEYS[2]).ok
 if index_type ~= 'none' and index_type ~= 'set' then
   return redis.error_reply('WRONGTYPE subpath index key must hold a set')
 end
+if not redis.acl_check_cmd('DEL', KEYS[1]) then
+  return redis.error_reply('NOPERM delete requires DEL access')
+end
+if not redis.acl_check_cmd('SREM', KEYS[2], ARGV[1]) then
+  return redis.error_reply('NOPERM delete requires SREM access')
+end
 redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[1])
 return 1
@@ -61,14 +79,24 @@ end
 if sessions_type ~= 'none' and sessions_type ~= 'zset' then
   return redis.error_reply('WRONGTYPE session index key must hold a zset')
 end
+if not redis.acl_check_cmd('SMEMBERS', KEYS[2]) then
+  return redis.error_reply('NOPERM delete requires SMEMBERS access')
+end
 local subpaths = redis.call('SMEMBERS', KEYS[2])
-redis.call('DEL', KEYS[1], KEYS[2])
-for i = 1, #subpaths, 1000 do
-  local keys = {}
-  for j = i, math.min(i + 999, #subpaths) do
-    keys[#keys + 1] = KEYS[1] .. ':' .. subpaths[j]
+local delete_keys = {KEYS[1], KEYS[2]}
+for i = 1, #subpaths do
+  delete_keys[#delete_keys + 1] = KEYS[1] .. ':' .. subpaths[i]
+end
+for i = 1, #delete_keys, 1000 do
+  if not redis.acl_check_cmd('DEL', unpack(delete_keys, i, math.min(i + 999, #delete_keys))) then
+    return redis.error_reply('NOPERM delete requires DEL access')
   end
-  redis.call('DEL', unpack(keys))
+end
+if not redis.acl_check_cmd('ZREM', KEYS[3], ARGV[1]) then
+  return redis.error_reply('NOPERM delete requires ZREM access')
+end
+for i = 1, #delete_keys, 1000 do
+  redis.call('DEL', unpack(delete_keys, i, math.min(i + 999, #delete_keys)))
 end
 redis.call('ZREM', KEYS[3], ARGV[1])
 return 1

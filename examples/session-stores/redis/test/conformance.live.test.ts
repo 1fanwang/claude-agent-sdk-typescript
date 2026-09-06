@@ -21,6 +21,35 @@ describe.skipIf(!url)('RedisSessionStore (live conformance)', () => {
     () => new RedisSessionStore({ client, prefix: `${root}:${n++}` }),
   )
 
+  async function createRestrictedClient(
+    prefix: string,
+    commands: string[],
+  ): Promise<{ redis: Redis; username: string }> {
+    const username = `${root.replace(/[^a-zA-Z0-9]/g, '')}${n++}`
+    const password = 'review-password'
+    await client.call(
+      'ACL',
+      'SETUSER',
+      username,
+      'reset',
+      'on',
+      `>${password}`,
+      `~${prefix}:*`,
+      '+eval',
+      '+type',
+      ...commands,
+    )
+    return {
+      redis: new Redis(url!, {
+        enableReadyCheck: false,
+        lazyConnect: false,
+        username,
+        password,
+      }),
+      username,
+    }
+  }
+
   test('append rejects Redis transaction command errors', async () => {
     const prefix = `${root}:errors`
     const store = new RedisSessionStore({ client, prefix })
@@ -96,6 +125,131 @@ describe.skipIf(!url)('RedisSessionStore (live conformance)', () => {
 
     await expect(store.delete(key)).rejects.toThrow('WRONGTYPE')
     expect(await store.load(key)).toEqual([entry])
+  })
+
+  test('append does not mutate when the session index cannot be updated', async () => {
+    const prefix = `${root}:append-acl`
+    const { redis, username } = await createRestrictedClient(prefix, [
+      '+rpush',
+    ])
+    const store = new RedisSessionStore({ client: redis, prefix })
+    try {
+      await expect(
+        store.append(
+          { projectKey: 'p', sessionId: 's' },
+          [{ type: 'assistant' }],
+        ),
+      ).rejects.toThrow()
+      expect(await client.lrange(`${prefix}:p:s`, 0, -1)).toEqual([])
+    } finally {
+      await redis.quit()
+      await client.call('ACL', 'DELUSER', username)
+    }
+  })
+
+  test('main delete does not mutate when the session index cannot be updated', async () => {
+    const prefix = `${root}:delete-main-acl`
+    const key = { projectKey: 'p', sessionId: 's' }
+    const entry = { type: 'assistant' }
+    await new RedisSessionStore({ client, prefix }).append(key, [entry])
+    const { redis, username } = await createRestrictedClient(prefix, [
+      '+smembers',
+      '+del',
+    ])
+    try {
+      await expect(
+        new RedisSessionStore({ client: redis, prefix }).delete(key),
+      ).rejects.toThrow()
+      expect(
+        await new RedisSessionStore({ client, prefix }).load(key),
+      ).toEqual([entry])
+    } finally {
+      await redis.quit()
+      await client.call('ACL', 'DELUSER', username)
+    }
+  })
+
+  test('subpath delete does not mutate when its index cannot be updated', async () => {
+    const prefix = `${root}:delete-subpath-acl`
+    const key = {
+      projectKey: 'p',
+      sessionId: 's',
+      subpath: 'subagents/a',
+    }
+    const entry = { type: 'assistant' }
+    await new RedisSessionStore({ client, prefix }).append(key, [entry])
+    const { redis, username } = await createRestrictedClient(prefix, ['+del'])
+    try {
+      await expect(
+        new RedisSessionStore({ client: redis, prefix }).delete(key),
+      ).rejects.toThrow()
+      expect(
+        await new RedisSessionStore({ client, prefix }).load(key),
+      ).toEqual([entry])
+    } finally {
+      await redis.quit()
+      await client.call('ACL', 'DELUSER', username)
+    }
+  })
+
+  test('main delete preflights each exact multi-key batch', async () => {
+    const prefix = `${root}:delete-batch-acl`
+    const key = { projectKey: 'p', sessionId: 's' }
+    const entry = JSON.stringify({ type: 'assistant' })
+    const entryKey = `${prefix}:p:s`
+    const subkeysKey = `${entryKey}:__subkeys`
+    const sessionsKey = `${prefix}:p:__sessions`
+    const subpaths = Array.from(
+      { length: 1002 },
+      (_, index) => `subagents/${index}`,
+    )
+    const setup = client.pipeline().rpush(entryKey, entry)
+    for (const subpath of subpaths) {
+      setup.rpush(`${entryKey}:${subpath}`, entry)
+      setup.sadd(subkeysKey, subpath)
+    }
+    setup.zadd(sessionsKey, Date.now(), key.sessionId)
+    await setup.exec()
+
+    const orderedSubpaths = await client.smembers(subkeysKey)
+    const deleteKeys = [
+      entryKey,
+      subkeysKey,
+      ...orderedSubpaths.map(subpath => `${entryKey}:${subpath}`),
+    ]
+    const username = `${root.replace(/[^a-zA-Z0-9]/g, '')}${n++}`
+    const password = 'review-password'
+    const permissions = '+eval +type +smembers +del +zrem'
+    const selector = (keys: string[]) =>
+      `(${permissions} ${keys.map(redisKey => `~${redisKey}`).join(' ')})`
+    await client.call(
+      'ACL',
+      'SETUSER',
+      username,
+      'reset',
+      'on',
+      `>${password}`,
+      selector([...deleteKeys.slice(0, 1000), sessionsKey]),
+      selector(deleteKeys.slice(1000, 1002)),
+      selector(deleteKeys.slice(1002)),
+    )
+    const redis = new Redis(url!, {
+      enableReadyCheck: false,
+      lazyConnect: false,
+      username,
+      password,
+    })
+    try {
+      await expect(
+        new RedisSessionStore({ client: redis, prefix }).delete(key),
+      ).rejects.toThrow()
+      expect(await client.llen(entryKey)).toBe(1)
+      expect(await client.scard(subkeysKey)).toBe(subpaths.length)
+      expect(await client.zscore(sessionsKey, key.sessionId)).not.toBeNull()
+    } finally {
+      await redis.quit()
+      await client.call('ACL', 'DELUSER', username)
+    }
   })
 
   afterAll(async () => {
