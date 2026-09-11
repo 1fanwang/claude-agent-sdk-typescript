@@ -40,7 +40,7 @@ describe.skipIf(!url)('RedisSessionStore (live conformance)', () => {
       ...commands,
     )
     return {
-      redis: new Redis(url!, {
+      redis: client.duplicate({
         enableReadyCheck: false,
         lazyConnect: false,
         username,
@@ -233,7 +233,7 @@ describe.skipIf(!url)('RedisSessionStore (live conformance)', () => {
       selector(deleteKeys.slice(1000, 1002)),
       selector(deleteKeys.slice(1002)),
     )
-    const redis = new Redis(url!, {
+    const redis: Redis = client.duplicate({
       enableReadyCheck: false,
       lazyConnect: false,
       username,
